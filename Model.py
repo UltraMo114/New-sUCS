@@ -10,12 +10,13 @@ class NewSUCS(nn.Module):
         1. XYZ -> LMS (Normalized HPE)
         2. Non-linearity: Naka-Rushton Response (S-curve)
         3. Linear Transform: LMS -> Iab (Fixed RGYB)
-        4. Chroma Compression: Tanh (Soft Saturation)
-        
-    Trained Parameters (from optimization results):
-        Gamma: 0.7037
-        Sigma: 0.74491
-        T:     67.0247
+        4. Chroma Compression: Dual-parameter Log (Soft Saturation)
+
+    Trained Parameters (from dual-log optimization):
+        Gamma: 0.7174
+        Sigma: 0.6464
+        T1:    59.5784  (log scale)
+        T2:    39.8886  (log rate)
     """
     
     def __init__(self, device='cpu', dtype=torch.float32):
@@ -24,11 +25,12 @@ class NewSUCS(nn.Module):
         self.dtype = dtype
         
         # =================================================================
-        # 1. Trained Parameters (Hardcoded from Training Result)
+        # 1. Trained Parameters (Dual-Log Calibration)
         # =================================================================
-        self.gamma_val = 0.7037
-        self.sigma_val = 0.74491
-        self.t_val     = 67.0247
+        self.gamma_val = 0.7174
+        self.sigma_val = 0.6464
+        self.t1_val    = 59.5784  # log scale (outer)
+        self.t2_val    = 39.8886  # log rate (inner)
         
         # M_Raw from optimization result
         m_raw_np = np.array([
@@ -68,10 +70,11 @@ class NewSUCS(nn.Module):
         self.register_buffer('M_Iab', torch.tensor(m_iab_np, device=device, dtype=dtype))
         self.register_buffer('M_HPE_inv', torch.tensor(np.linalg.inv(m_hpe_norm), device=device, dtype=dtype))
         self.register_buffer('M_Iab_inv', torch.tensor(np.linalg.inv(m_iab_np), device=device, dtype=dtype))
-        
+
         self.register_buffer('Gamma', torch.tensor(self.gamma_val, device=device, dtype=dtype))
         self.register_buffer('Sigma', torch.tensor(self.sigma_val, device=device, dtype=dtype))
-        self.register_buffer('T',     torch.tensor(self.t_val, device=device, dtype=dtype))
+        self.register_buffer('T1',    torch.tensor(self.t1_val, device=device, dtype=dtype))
+        self.register_buffer('T2',    torch.tensor(self.t2_val, device=device, dtype=dtype))
         self.register_buffer('Gain',  torch.tensor(self.gain_val, device=device, dtype=dtype))
         
         # Standard sRGB to XYZ Matrix (D65) for convenience
@@ -141,20 +144,18 @@ class NewSUCS(nn.Module):
         I = iab_lin[:, 0:1]
         a = iab_lin[:, 1:2]
         b = iab_lin[:, 2:3]
-        
-        # 5. Tanh Chroma Compression (Soft Saturation)
-        # C_out = T * tanh(C_in / T)
-        C_lin = torch.sqrt(a**2 + b**2 + eps)
-        
-        C_out = self.T * torch.tanh(C_lin / self.T)
-        
+
+        # 5. Dual-parameter log chroma compression (soft saturation)
+        # C_out = T1 * log(1 + C_in / T2)
+        C_lin = torch.sqrt(a ** 2 + b ** 2 + eps)
+        C_out = self.T1 * torch.log1p(C_lin / self.T2)
+
         # Scaling factor G = C_out / C_in
         scale = C_out / C_lin
-        
-        # Reconstruct
+
         a_out = a * scale
         b_out = b * scale
-        
+
         return torch.cat([I, a_out, b_out], dim=1)
 
     # =================================================================
@@ -171,17 +172,14 @@ class NewSUCS(nn.Module):
         a_prime = sucs[:, 1:2]
         b_prime = sucs[:, 2:3]
         
-        # 1. Inverse Chroma Compression (arctanh)
-        # C_in = T * arctanh(C_out / T)
+        # 1. Inverse chroma compression (dual-parameter log)
         eps = 1e-8
-        C_out = torch.sqrt(a_prime**2 + b_prime**2 + eps)
-        
-        # Safety clip for atanh domain (-1, 1)
-        # In optimization, points might drift slightly out, so we clamp lightly
-        ratio = torch.clamp(C_out / self.T, -0.9999, 0.9999)
-        
-        C_lin = self.T * torch.atanh(ratio)
-        
+        C_out = torch.sqrt(a_prime ** 2 + b_prime ** 2 + eps)
+
+        # Forward: C_out = T1 * log(1 + C_in / T2)
+        # Inverse: C_in = T2 * (exp(C_out / T1) - 1)
+        C_lin = self.T2 * (torch.exp(C_out / self.T1) - 1.0)
+
         scale = C_lin / C_out
         a_lin = a_prime * scale
         b_lin = b_prime * scale

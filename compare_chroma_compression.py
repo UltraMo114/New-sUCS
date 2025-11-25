@@ -20,11 +20,12 @@ def original_sucs_chroma(C: np.ndarray) -> np.ndarray:
 
 def new_sucs_chroma(C: np.ndarray, T: float) -> np.ndarray:
     """
-    New sUCS chroma compression used in Model.xyz_to_sucs:
+    New sUCS chroma compression used in Model.xyz_to_sucs (dual-log):
 
-        C_out = T * tanh(C_in / T)
+        C_out = T1 * log(1 + C_in / T2)
     """
-    return T * np.tanh(C / T)
+    T1, T2 = T
+    return T1 * np.log1p(C / T2)
 
 
 def main(output_path: str = "chroma_compression_sucs_vs_new.png"):
@@ -33,20 +34,21 @@ def main(output_path: str = "chroma_compression_sucs_vs_new.png"):
     New sUCS tanh-based chroma compression over a range of C values.
     """
     model = NewSUCS(device="cpu")
-    T = float(model.T.cpu().item())
+    T1 = float(model.T1.cpu().item())
+    T2 = float(model.T2.cpu().item())
 
     # Chroma range: from 0 to a value that clearly shows saturation behaviour.
     C = np.linspace(0.0, 200.0, 1001, dtype=np.float64)
 
     y_orig = original_sucs_chroma(C)
-    y_new = new_sucs_chroma(C, T)
+    y_new = new_sucs_chroma(C, (T1, T2))
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
     # Full range comparison.
     ax = axes[0]
     ax.plot(C, y_orig, label="Original sUCS: log(1 + 0.0447*C)/0.0252", color="blue")
-    ax.plot(C, y_new, label=f"New sUCS: T*tanh(C/T), T={T:.2f}", color="red")
+    ax.plot(C, y_new, label=f"New sUCS: T1*log(1 + C/T2), T1={T1:.2f}, T2={T2:.2f}", color="red")
     ax.set_xlabel("Input chroma C")
     ax.set_ylabel("Compressed chroma")
     ax.set_title("Chroma compression (full range)")
@@ -57,7 +59,7 @@ def main(output_path: str = "chroma_compression_sucs_vs_new.png"):
     ax = axes[1]
     mask = C <= 40.0
     ax.plot(C[mask], y_orig[mask], label="Original", color="blue")
-    ax.plot(C[mask], y_new[mask], label="New (tanh)", color="red")
+    ax.plot(C[mask], y_new[mask], label="New (dual-log)", color="red")
     ax.set_xlabel("Input chroma C (zoomed)")
     ax.set_ylabel("Compressed chroma")
     ax.set_title("Chroma compression (near zero)")
@@ -71,4 +73,3 @@ def main(output_path: str = "chroma_compression_sucs_vs_new.png"):
 
 if __name__ == "__main__":
     main()
-
