@@ -1,0 +1,30 @@
+# Python cache and envs
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editor cruft
+.DS_Store
+Thumbs.db
+
+# Root-level experiment renders (documentation assets live in doc/)
+/*.png
+
+# Experiment scratch spaces
+experiments/
+experiments2/
+experiments3/
+
+# HDR gradient sandbox outputs
+hdr_gradient_workspace/artifacts/
+hdr_gradient_workspace/cuda_probe/
+hdr_gradient_workspace/report_runs/
+hdr_gradient_workspace/smoke_landscape/
+
+# Tone-mapping comparison workspace artifacts
+tmo_workspace/__pycache__/
+tmo_workspace/outputs/
+
+# Misc temporary files
+*.tmp
+*.log
