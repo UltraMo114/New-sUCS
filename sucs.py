@@ -1,5 +1,7 @@
+# -*- coding: utf-8 -*-
 import numpy as np
 import argparse
+from typing import Callable, Dict, List
 
 import torch
 import torch.nn as nn
@@ -14,6 +16,93 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import colour
 from Model import NewSUCS as NewSUCSModel
 
+# Registries for colour spaces and colormap initializations.
+COLOR_SPACE_REGISTRY: Dict[str, type["BaseColorSpace"]] = {}
+COLOR_SPACE_DISPLAY_NAMES: Dict[str, str] = {}
+COLORMAP_REGISTRY: Dict[str, str] = {}
+MODEL_COLOR_HINTS: Dict[str, str] = {
+    "lab": "tab:red",
+    "oklab": "tab:green",
+    "sucs": "tab:blue",
+    "jzazbz": "tab:orange",
+    "cam16ucs": "tab:brown",
+}
+BASELINE_CMAP_METRICS: Dict[str, float] = {
+    "viridis": 0.0705,
+    "plasma": 0.1567,
+    "inferno": 0.1420,
+    "magma": 0.1420,
+    "cividis": 0.0911,
+    "turbo": 0.2140,
+}
+
+
+def register_color_space(name: str, display_name: str):
+    """
+    Decorator used to register a color-space optimization module.
+    """
+
+    def decorator(cls: type["BaseColorSpace"]) -> type["BaseColorSpace"]:
+        COLOR_SPACE_REGISTRY[name] = cls
+        COLOR_SPACE_DISPLAY_NAMES[name] = display_name
+        cls.space_name = name
+        cls.display_name = display_name
+        return cls
+
+    return decorator
+
+
+def register_colormap(name: str, mpl_name: str | None = None) -> None:
+    """
+    Register a Matplotlib colormap for initialization.
+    """
+
+    COLORMAP_REGISTRY[name] = mpl_name or name
+
+
+class BaseColorSpace(nn.Module):
+    """
+    Shared scaffolding for differentiable colour spaces.
+    """
+
+    space_name: str = "base"
+    display_name: str = "Base"
+    supports_optimization: bool = True
+
+    def __init__(self, init_control_points_rgb: np.ndarray, device: str = "cpu"):
+        super().__init__()
+        self.device = torch.device(device)
+        self.setup_latent_space(self.device)
+        latent = self.rgb_to_latent(init_control_points_rgb.astype(np.float32))
+        self.control_points = nn.Parameter(torch.from_numpy(latent).to(self.device))
+        self.last_fraction_outside: float = 0.0
+
+    def rgb_to_latent(self, rgb: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def latent_to_rgb(self, latent: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def post_step(self) -> None:
+        """
+        Optional hook executed after each optimizer step (e.g., latent clamping).
+        """
+
+    def setup_latent_space(self, device: torch.device) -> None:
+        """
+        Hook for subclasses to initialize latent-space specific resources
+        (e.g., differentiable transforms) once the nn.Module base has been
+        initialized.
+        """
+
+    def forward(self, num_samples: int = 256) -> torch.Tensor:
+        dense_latent = resample_control_points(self.control_points, num_samples)
+        rgb = self.latent_to_rgb(dense_latent)
+        with torch.no_grad():
+            outside = (rgb < 0.0) | (rgb > 1.0)
+            self.last_fraction_outside = float(outside.float().mean().cpu().item())
+        return rgb
+
 
 # ============================================================
 # Module A: Referee (perceptual uniformity metrics)
@@ -23,11 +112,6 @@ from Model import NewSUCS as NewSUCSModel
 class Referee:
     """
     Perceptual referee for colormap uniformity.
-
-    默认使用 CAM16-UCS 作为感知距离度量，以避免对 CIELAB
-    baseline 的偏置（避免“既当裁判员又当运动员”）。
-    原始 Bujack et al. 使用的是 CIEDE2000 + CIELAB，这里将
-    ΔE_00 换成 CAM16-UCS 的欧氏距离。
     """
 
     def __init__(self, metric: str = "DE2000"):
@@ -67,8 +151,8 @@ class Referee:
         """
         Convert sRGB samples in [0, 1] to CAM16-UCS J'a'b'.
 
-        使用与 UCS 模型一致的 sRGB → 线性 → XYZ 管线，再用
-        colour-science 提供的 XYZ_to_CAM16UCS 进行变换。
+        使用�?UCS 模型一致的 sRGB �?线�?�?XYZ 管线，再�?
+        colour-science 提供�?XYZ_to_CAM16UCS 进行变换�?
         """
         rgb = np.clip(rgb, 0.0, 1.0).astype(np.float32)
         rgb_linear = srgb_to_linear_np(rgb)
@@ -104,18 +188,6 @@ class Referee:
         v_min = float(np.min(d))
 
         return {"sigma_v": sigma_v, "v_min": v_min}
-        # 先转到 CAM16-UCS 空间，再在该空间内计算相邻点的欧氏感知距离。
-        ucs = self.rgb_to_cam16ucs(rgb)
-
-        # Neighbor distances: d_i = ΔE_CAM16UCS(C_i, C_{i+1})
-        ucs1 = ucs[:-1]
-        ucs2 = ucs[1:]
-        d = colour.delta_E(ucs1, ucs2, method="CAM16-UCS")
-
-        sigma_v = float(np.std(d, ddof=1))
-        v_min = float(np.min(d))
-
-        return {"sigma_v": sigma_v, "v_min": v_min}
 
 
 # ============================================================
@@ -141,6 +213,16 @@ def resample_control_points(control_points: torch.Tensor, num_samples: int) -> t
     x = control_points.T.unsqueeze(0)  # (1, 3, K)
     x_upsampled = F.interpolate(x, size=num_samples, mode="linear", align_corners=True)
     return x_upsampled.squeeze(0).T  # (num_samples, 3)
+
+
+def compute_gamut_penalty(rgb: torch.Tensor) -> torch.Tensor:
+    """
+    Quadratic penalty measuring how far samples are outside [0, 1].
+    """
+    below = F.relu(-rgb)
+    above = F.relu(rgb - 1.0)
+    penalty = below.square() + above.square()
+    return penalty.mean()
 
 
 def lab_to_xyz_torch(lab: torch.Tensor) -> torch.Tensor:
@@ -268,6 +350,124 @@ _SRGB_TO_XYZ = np.array(
     dtype=np.float64,
 )
 
+PQ_C1 = 3424.0 / 4096.0
+PQ_C2 = 2413.0 / 128.0
+PQ_C3 = 2392.0 / 128.0
+PQ_M1 = 2610.0 / 16384.0
+PQ_M2 = 2523.0 / 32.0
+JZ_B = 1.15
+JZ_G = 0.66
+JZ_D = -0.56
+JZ_D0 = 1.6295499532821566e-11
+
+BT2020_RGB_TO_XYZ = np.array(
+    [
+        [0.63695805, 0.1446169, 0.16888098],
+        [0.26270021, 0.67799807, 0.05930172],
+        [0.0, 0.02807269, 1.06098506],
+    ],
+    dtype=np.float64,
+)
+BT2020_XYZ_TO_RGB = np.array(
+    [
+        [1.71665119, -0.35567078, -0.25336628],
+        [-0.66668435, 1.61648124, 0.01576855],
+        [0.01763986, -0.04277061, 0.94210312],
+    ],
+    dtype=np.float64,
+)
+
+JZ_XYZ_TO_LMS = np.array(
+    [
+        [0.41478972, 0.579999, 0.0146480],
+        [-0.2015100, 1.120649, 0.0531008],
+        [-0.0166008, 0.264800, 0.6684799],
+    ],
+    dtype=np.float64,
+)
+JZ_LMS_TO_XYZ = np.linalg.inv(JZ_XYZ_TO_LMS)
+JZ_LMSP_TO_IZAZBZ = np.array(
+    [
+        [0.5, 0.5, 0.0],
+        [3.524000, -4.066708, 0.542708],
+        [0.199076, 1.096799, -1.295875],
+    ],
+    dtype=np.float64,
+)
+JZ_IZAZBZ_TO_LMSP = np.linalg.inv(JZ_LMSP_TO_IZAZBZ)
+
+
+def pq_encode_np(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, None) / 10000.0
+    x = np.power(x, PQ_M1)
+    numerator = PQ_C1 + PQ_C2 * x
+    denominator = 1.0 + PQ_C3 * x
+    return np.power(numerator / denominator, PQ_M2)
+
+
+def pq_decode_np(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, 1.0)
+    x = np.power(x, 1.0 / PQ_M2)
+    numerator = np.clip(x - PQ_C1, 0.0, None)
+    denominator = PQ_C2 - PQ_C3 * x
+    ratio = np.clip(numerator / (denominator + 1e-12), 0.0, None)
+    return 10000.0 * np.power(ratio, 1.0 / PQ_M1)
+
+
+def pq_encode_torch(x: torch.Tensor) -> torch.Tensor:
+    x = torch.clamp(x, min=0.0) / 10000.0
+    x = torch.pow(x, PQ_M1)
+    numerator = PQ_C1 + PQ_C2 * x
+    denominator = 1.0 + PQ_C3 * x
+    return torch.pow(numerator / denominator, PQ_M2)
+
+
+def pq_decode_torch(x: torch.Tensor) -> torch.Tensor:
+    x = torch.clamp(x, min=0.0, max=1.0)
+    x = torch.pow(x, 1.0 / PQ_M2)
+    numerator = torch.clamp(x - PQ_C1, min=0.0)
+    denominator = PQ_C2 - PQ_C3 * x
+    ratio = torch.clamp(numerator / (denominator + 1e-12), min=0.0)
+    return 10000.0 * torch.pow(ratio, 1.0 / PQ_M1)
+
+
+def xyz_to_jzazbz_np(xyz: np.ndarray) -> np.ndarray:
+    X = xyz[..., 0]
+    Y = xyz[..., 1]
+    Z = xyz[..., 2]
+    X_p = JZ_B * X - (JZ_B - 1.0) * Z
+    Y_p = JZ_G * Y - (JZ_G - 1.0) * X
+    Z_p = Z
+    xyz_p = np.stack([X_p, Y_p, Z_p], axis=-1)
+    lms = np.matmul(xyz_p, JZ_XYZ_TO_LMS.T)
+    lms = np.clip(lms, 0.0, None)
+    lms_p = pq_encode_np(lms)
+    izazbz = np.matmul(lms_p, JZ_LMSP_TO_IZAZBZ.T)
+    Iz = izazbz[..., 0]
+    az = izazbz[..., 1]
+    bz = izazbz[..., 2]
+    Jz = ((1.0 + JZ_D) * Iz) / (1.0 + JZ_D * Iz) - JZ_D0
+    return np.stack([Jz, az, bz], axis=-1)
+
+
+def jzazbz_to_xyz_torch(jzazbz: torch.Tensor) -> torch.Tensor:
+    Jz = jzazbz[..., 0]
+    az = jzazbz[..., 1]
+    bz = jzazbz[..., 2]
+    numerator = Jz + JZ_D0
+    denominator = 1.0 + JZ_D - JZ_D * (Jz + JZ_D0)
+    Iz = numerator / torch.clamp(denominator, min=1e-8)
+    izazbz = torch.stack([Iz, az, bz], dim=-1)
+    lms_p = torch.matmul(izazbz, jzazbz.new_tensor(JZ_IZAZBZ_TO_LMSP).T)
+    lms = pq_decode_torch(lms_p)
+    xyz_p = torch.matmul(lms, jzazbz.new_tensor(JZ_LMS_TO_XYZ).T)
+    X_p = xyz_p[..., 0]
+    Y_p = xyz_p[..., 1]
+    Z_p = xyz_p[..., 2]
+    X = (X_p + (JZ_B - 1.0) * Z_p) / JZ_B
+    Y = (Y_p + (JZ_G - 1.0) * X) / JZ_G
+    return torch.stack([X, Y, Z_p], dim=-1)
+
 
 def rgb_to_oklab_np(rgb: np.ndarray) -> np.ndarray:
     """
@@ -295,114 +495,126 @@ def oklab_to_linear_srgb_torch(oklab: torch.Tensor) -> torch.Tensor:
     return rgb_linear
 
 
-class BaselineCIELAB(nn.Module):
+@register_color_space("lab", "Baseline CIELAB")
+class CIELABColorSpace(BaseColorSpace):
     """
-    Baseline model operating in CIELAB space.
-
-    The parameters are Lab control points; output is sRGB after
-    Lab -> XYZ -> linear RGB -> gamma, followed by a hard clamp
-    to [0, 1] to simulate gamut clipping artifacts:
-      - Nardini et al., CGF 2021.
-    """
-
-    def __init__(self, init_control_points_lab: np.ndarray, device: str = "cpu"):
-        super().__init__()
-        cp = torch.from_numpy(init_control_points_lab.astype(np.float32))
-        self.control_points = nn.Parameter(cp.to(device))
-        # Fraction of samples outside [0, 1] before clamping in the last forward pass.
-        self.last_fraction_outside: float = 0.0
-
-    def forward(self, num_samples: int = 256) -> torch.Tensor:
-        dense_lab = resample_control_points(self.control_points, num_samples)
-        xyz = lab_to_xyz_torch(dense_lab)
-        rgb_linear = xyz_to_linear_srgb_torch(xyz)
-        rgb = linear_to_srgb_torch(rgb_linear)
-        # Measure how many samples are outside the displayable [0, 1] range
-        # before clamping (simulates gamut clipping artifacts).
-        with torch.no_grad():
-            outside = (rgb < 0.0) | (rgb > 1.0)
-            self.last_fraction_outside = float(outside.float().mean().cpu().item())
-        # Hard clipping in output space (simulates gamut clipping)
-        rgb = torch.clamp(rgb, 0.0, 1.0)
-        return rgb
-
-
-class BaselineOkLab(nn.Module):
-    """
-    Baseline model operating in OkLab space.
-
-    Parameters live in OkLab; output is sRGB via:
-      OkLab -> LMS' -> LMS -> linear RGB -> gamma,
-    followed by hard clamp to [0, 1] to simulate gamut clipping.
-    """
-
-    def __init__(self, init_control_points_oklab: np.ndarray, device: str = "cpu"):
-        super().__init__()
-        cp = torch.from_numpy(init_control_points_oklab.astype(np.float32))
-        self.control_points = nn.Parameter(cp.to(device))
-        self.last_fraction_outside: float = 0.0
-
-    def forward(self, num_samples: int = 256) -> torch.Tensor:
-        dense_oklab = resample_control_points(self.control_points, num_samples)
-        rgb_linear = oklab_to_linear_srgb_torch(dense_oklab)
-        rgb = linear_to_srgb_torch(rgb_linear)
-        with torch.no_grad():
-            outside = (rgb < 0.0) | (rgb > 1.0)
-            self.last_fraction_outside = float(outside.float().mean().cpu().item())
-        rgb = torch.clamp(rgb, 0.0, 1.0)
-        return rgb
-
-
-class OursNewSUCS(nn.Module):
-    """
-    New sUCS optimization space using the UCS implementation from Model.py.
-
-    Parameters live in the New sUCS latent space (J, a', b'). The mapping
-    to sRGB is performed by the NewSUCS colour model, which uses
-    Naka-Rushton response and tanh-based chroma compression (soft saturation)
-    and does not apply any hard clipping in RGB space.
+    CIELAB latent optimization space.
     """
 
     def __init__(self, init_control_points_rgb: np.ndarray, device: str = "cpu"):
-        super().__init__()
-        self.device = torch.device(device)
-        # Bound for a' and b' components in the New sUCS latent space.
-        # Based on ab-plane analysis, ±40–45 covers the bulk of the sRGB
-        # gamut at mid lightness without pushing far into out-of-gamut
-        # regions. We choose a conservative ±40 here.
-        self.ab_bound: float = 40.0
+        self._referee = Referee()
+        super().__init__(init_control_points_rgb, device)
 
-        # Fixed, differentiable colour transform: sUCS <-> XYZ <-> sRGB.
-        self.sucs_model = NewSUCSModel(device=self.device, dtype=torch.float32)
+    def rgb_to_latent(self, rgb: np.ndarray) -> np.ndarray:
+        return self._referee.rgb_to_lab(rgb).astype(np.float32)
 
-        # Initialize control points in sUCS space corresponding to the
-        # provided RGB control points.
-        rgb_np = init_control_points_rgb.astype(np.float32)
-        rgb_t = torch.from_numpy(rgb_np).to(self.device)
+    def latent_to_rgb(self, latent: torch.Tensor) -> torch.Tensor:
+        xyz = lab_to_xyz_torch(latent)
+        rgb_linear = xyz_to_linear_srgb_torch(xyz)
+        return linear_to_srgb_torch(rgb_linear)
 
+
+@register_color_space("oklab", "Baseline OkLab")
+class OkLabColorSpace(BaseColorSpace):
+    """
+    OkLab latent optimization space.
+    """
+
+    def rgb_to_latent(self, rgb: np.ndarray) -> np.ndarray:
+        return rgb_to_oklab_np(rgb).astype(np.float32)
+
+    def latent_to_rgb(self, latent: torch.Tensor) -> torch.Tensor:
+        rgb_linear = oklab_to_linear_srgb_torch(latent)
+        return linear_to_srgb_torch(rgb_linear)
+
+
+@register_color_space("sucs", "Ours New sUCS")
+class NewSUCSpace(BaseColorSpace):
+    """
+    Log-version New sUCS latent space.
+    """
+
+    def setup_latent_space(self, device: torch.device) -> None:
+        self.sucs_model = NewSUCSModel(device=device, dtype=torch.float32)
+
+    def rgb_to_latent(self, rgb: np.ndarray) -> np.ndarray:
+        rgb_lin = srgb_to_linear_np(rgb).astype(np.float32)
+        rgb_t = torch.from_numpy(rgb_lin).to(self.device)
         with torch.no_grad():
-            # For initialization we follow the usage example in Model.py:
-            # treat RGB inputs as linear and map directly to XYZ.
             xyz = torch.matmul(rgb_t, self.sucs_model.M_sRGB_to_XYZ.T)
             sucs = self.sucs_model.xyz_to_sucs(xyz)
-            # Constrain initial a'/b' to stay within a reasonable range so
-            # that optimization starts well inside the sUCS "ball" that maps
-            # safely to sRGB.
-            # sucs[:, 1:] = torch.clamp(sucs[:, 1:], -self.ab_bound, self.ab_bound)
+        return sucs.cpu().numpy().astype(np.float32)
 
-        self.control_points = nn.Parameter(sucs)
-        # Fraction of samples outside [0, 1] in the last forward pass.
-        self.last_fraction_outside: float = 0.0
+    def latent_to_rgb(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.sucs_model.sucs_to_srgb(latent)
 
-    def forward(self, num_samples: int = 256) -> torch.Tensor:
-        # Interpolate in the New sUCS latent space.
-        dense_sucs = resample_control_points(self.control_points, num_samples)
-        # Map to sRGB through the New sUCS model (soft saturation, no hard clamp).
-        rgb = self.sucs_model.sucs_to_srgb(dense_sucs)
-        with torch.no_grad():
-            outside = (rgb < 0.0) | (rgb > 1.0)
-            self.last_fraction_outside = float(outside.float().mean().cpu().item())
-        return rgb
+
+@register_color_space("jzazbz", "JzAzBz")
+class JzAzBzColorSpace(BaseColorSpace):
+    """
+    JzAzBz HDR-uniform latent space.
+    """
+
+    def rgb_to_latent(self, rgb: np.ndarray) -> np.ndarray:
+        rgb_lin = srgb_to_linear_np(rgb)
+        xyz = np.matmul(rgb_lin, _SRGB_TO_XYZ.T)
+        jz = xyz_to_jzazbz_np(xyz)
+        return jz.astype(np.float32)
+
+    def latent_to_rgb(self, latent: torch.Tensor) -> torch.Tensor:
+        xyz = jzazbz_to_xyz_torch(latent)
+        rgb_linear = xyz_to_linear_srgb_torch(xyz)
+        return linear_to_srgb_torch(rgb_linear)
+
+
+@register_color_space("cam16ucs", "CAM16-UCS")
+class CAM16UCSColorSpace(BaseColorSpace):
+    """
+    Placeholder for CAM16-UCS optimization (not yet differentiable).
+    """
+
+    supports_optimization = False
+
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "CAM16-UCS is registered for evaluation only. Differentiable support "
+            "requires a dedicated implementation."
+        )
+
+
+def _register_default_colormaps() -> None:
+    defaults = [
+        "rainbow",
+        "jet",
+        "nipy_spectral",
+        "turbo",
+        "gist_rainbow",
+        "hsv",
+        "cubehelix",
+        "coolwarm",
+        "bwr",
+        "seismic",
+        "RdBu",
+        "Spectral",
+        "PuOr",
+        "PRGn",
+        "BrBG",
+        "PiYG",
+        "viridis",
+        "plasma",
+        "inferno",
+        "magma",
+        "cividis",
+        "RdYlBu",
+        "GnBu",
+        "YlOrRd",
+        "gray",
+    ]
+    for name in defaults:
+        register_colormap(name)
+
+
+_register_default_colormaps()
 
 
 # ============================================================
@@ -410,11 +622,88 @@ class OursNewSUCS(nn.Module):
 # ============================================================
 
 
+def resolve_color_spaces(selected: List[str]) -> tuple[list[str], list[str]]:
+    """
+    Filter and validate requested color spaces.
+    """
+
+    if not selected:
+        selected = ["lab", "oklab", "sucs"]
+    if any(name.lower() == "all" for name in selected):
+        selected = list(COLOR_SPACE_REGISTRY.keys())
+    normalized: list[str] = []
+    skipped: list[str] = []
+    for name in selected:
+        key = name.lower()
+        if key not in COLOR_SPACE_REGISTRY:
+            skipped.append(name)
+            continue
+        if COLOR_SPACE_REGISTRY[key].supports_optimization:
+            normalized.append(key)
+        else:
+            skipped.append(name)
+    return normalized, skipped
+
+
+def resolve_colormaps(selected: List[str]) -> list[str]:
+    """
+    Expand requested colormap names.
+    """
+
+    if not selected:
+        selected = ["rainbow"]
+    if any(name.lower() == "all" for name in selected):
+        return list(COLORMAP_REGISTRY.keys())
+    resolved: list[str] = []
+    for name in selected:
+        key = name.lower()
+        if key in COLORMAP_REGISTRY:
+            resolved.append(key)
+    return resolved
+
+
+def resolve_cmap_hyperparams(
+    cmap_name: str,
+    args,
+    initial_sigma_v: float | None = None,
+) -> tuple[int, float, float, dict]:
+    """
+    Determine control-point count, learning rate, and fidelity weight for a given colormap.
+    Returns (K, lr, fidelity_weight, metadata dict).
+    """
+
+    base_K = args.K
+    base_lr = args.lr
+    base_fidelity = args.fidelity_weight
+    metadata = {"auto_adjust": False, "sigma_v": initial_sigma_v}
+
+    if not args.auto_adjust:
+        return base_K, base_lr, base_fidelity, metadata
+
+    sigma = initial_sigma_v
+    if sigma is None:
+        key = cmap_name.lower()
+        sigma = BASELINE_CMAP_METRICS.get(key)
+
+    if sigma is None or sigma > args.adjust_threshold:
+        return base_K, base_lr, base_fidelity, metadata
+
+    ratio = max(sigma / args.adjust_threshold, 1e-3)
+    adjusted_lr = max(base_lr * ratio, args.hq_min_lr)
+    adjusted_K = min(int(base_K / ratio), args.hq_max_K)
+    adjusted_K = max(adjusted_K, base_K)
+    adjusted_fidelity = max(base_fidelity * (args.adjust_threshold / sigma), args.hq_min_fidelity)
+
+    metadata.update({"auto_adjust": True, "sigma_v": sigma})
+    return adjusted_K, adjusted_lr, adjusted_fidelity, metadata
+
+
 def build_initial_colormap(num_samples: int = 256, cmap_name: str = "rainbow") -> np.ndarray:
     """
     Build an initial non-uniform colormap (e.g., matplotlib's 'rainbow').
     """
-    cmap = plt.get_cmap(cmap_name)
+    mpl_name = COLORMAP_REGISTRY.get(cmap_name, cmap_name)
+    cmap = plt.get_cmap(mpl_name)
     xs = np.linspace(0.0, 1.0, num_samples)
     rgba = cmap(xs)
     rgb = rgba[:, :3]
@@ -422,39 +711,37 @@ def build_initial_colormap(num_samples: int = 256, cmap_name: str = "rainbow") -
 
 
 def create_models(
-    K: int = 10,
-    num_samples: int = 256,
+    color_spaces: List[str],
+    control_points_rgb: np.ndarray,
     device: str | torch.device = "cpu",
-) -> tuple[BaselineCIELAB, BaselineOkLab, OursNewSUCS, np.ndarray]:
+) -> Dict[str, BaseColorSpace]:
     """
-    Create three models and return them together with the initial RGB colormap.
+    Instantiate registered colour-space models.
     """
+
     device = torch.device(device)
-
-    initial_rgb = build_initial_colormap(num_samples=num_samples, cmap_name="rainbow")
-
-    # Extract K control points evenly spaced along the initial colormap.
-    indices = np.linspace(0, num_samples - 1, K, dtype=int)
-    control_points_rgb = initial_rgb[indices]
-
-    referee = Referee()
-    control_points_lab = referee.rgb_to_lab(control_points_rgb)
-    control_points_oklab = rgb_to_oklab_np(control_points_rgb)
-
-    model_lab = BaselineCIELAB(control_points_lab, device=device)
-    model_oklab = BaselineOkLab(control_points_oklab, device=device)
-    model_sucs = OursNewSUCS(control_points_rgb, device=device)
-
-    return model_lab, model_oklab, model_sucs, initial_rgb
+    models: Dict[str, BaseColorSpace] = {}
+    for name in color_spaces:
+        cls = COLOR_SPACE_REGISTRY[name]
+        models[name] = cls(control_points_rgb, device=device)
+    return models
 
 
 def run_optimization(
     num_epochs: int = 500,
     K: int = 10,
     num_samples: int = 256,
+    color_spaces: List[str] | None = None,
+    learning_rate: float = 1e-2,
+    fidelity_weight: float = 0.0,
+    adjust_metadata: dict | None = None,
     device: str | torch.device | None = None,
     ref_metric: str = "DE2000",
+    val_metric: str = "CAM16-UCS",
     seed: int | None = 0,
+    cmap_name: str = "rainbow",
+    gamut_penalty: float = 0.0,
+    control_point_jitter: float = 0.0,
 ):
     """
     Run joint optimization for all three models.
@@ -464,43 +751,46 @@ def run_optimization(
     else:
         device = torch.device(device)
 
-    # Optional global seeding for reproducibility. When running multi-seed
-    # experiments we will call this function with different seed values.
     if seed is not None:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-    model_lab, model_oklab, model_sucs, initial_rgb = create_models(
-        K=K, num_samples=num_samples, device=device
-    )
+    initial_rgb = build_initial_colormap(num_samples=num_samples, cmap_name=cmap_name)
+    indices = np.linspace(0, num_samples - 1, K, dtype=int)
+    control_points_rgb = initial_rgb[indices]
 
-    models = {
-        "lab": model_lab,
-        "oklab": model_oklab,
-        "sucs": model_sucs,
-    }
+    color_spaces = color_spaces or ["lab", "oklab", "sucs"]
+    models = create_models(color_spaces=color_spaces, control_points_rgb=control_points_rgb, device=device)
+    if not models:
+        raise ValueError("No valid colour spaces were selected for optimization.")
+    model_names = list(models.keys())
 
-    # Optimizer with separate parameter groups and unified learning rates.
-    optimizer = torch.optim.Adam(
-        [
-            {"params": model_lab.parameters(), "lr": 1e-2},
-            {"params": model_oklab.parameters(), "lr": 1e-2},
-            {"params": model_sucs.parameters(), "lr": 1e-2},
-        ]
-    )
+    jitter_scale = max(0.0, float(control_point_jitter))
+    if jitter_scale > 0.0:
+        for model in models.values():
+            with torch.no_grad():
+                noise = torch.randn_like(model.control_points) * jitter_scale
+                model.control_points.add_(noise)
 
-    referee = Referee(metric=ref_metric)
 
-    history_sigma = {name: [] for name in models}
-    history_vmin = {name: [] for name in models}
-    history_loss = {name: [] for name in models}
-    history_fraction_outside = {name: [] for name in models}
-    history_grad_norm = {name: [] for name in models}
+    optim_params = [{"params": model.parameters(), "lr": learning_rate} for model in models.values()]
+    optimizer = torch.optim.Adam(optim_params)
 
-    # Best-epoch tracking in terms of referee sigma_v (CIEDE2000).
-    best_sigma = {name: float("inf") for name in models}
-    best_epoch = {name: 0 for name in models}
+    report_referee = Referee(metric=ref_metric)
+    val_referee = Referee(metric=val_metric)
+
+    history_sigma = {name: [] for name in model_names}
+    history_sigma_val = {name: [] for name in model_names}
+    history_vmin = {name: [] for name in model_names}
+    history_loss = {name: [] for name in model_names}
+    history_fraction_outside = {name: [] for name in model_names}
+    history_grad_norm = {name: [] for name in model_names}
+
+    best_sigma_val = {name: float("inf") for name in model_names}
+    best_epoch = {name: 0 for name in model_names}
     best_colormaps = {}
+
+    initial_rgb_tensor = torch.from_numpy(initial_rgb).to(device)
 
     for epoch in range(num_epochs):
         optimizer.zero_grad()
@@ -508,67 +798,69 @@ def run_optimization(
         for name, model in models.items():
             rgb_out = model(num_samples=num_samples)
 
-            # Training loss: variance of neighbor distances in latent space.
             dense_latent = resample_control_points(model.control_points, num_samples)
             dists = torch.norm(dense_latent[1:] - dense_latent[:-1], dim=1)
-            loss = torch.var(dists)
-            loss.backward()
+            latent_loss = torch.var(dists)
 
-            # Gradient norm of control points (diagnostic for optimization behaviour).
+            total_loss = latent_loss
+            if gamut_penalty > 0.0:
+                penalty = compute_gamut_penalty(rgb_out)
+                total_loss = total_loss + gamut_penalty * penalty
+            else:
+                penalty = torch.zeros(1, device=device)
+
+            if fidelity_weight > 0.0:
+                fidelity_loss = F.mse_loss(rgb_out, initial_rgb_tensor)
+                total_loss = total_loss + fidelity_weight * fidelity_loss
+            else:
+                fidelity_loss = torch.zeros(1, device=device)
+
+            total_loss.backward()
+
             grad = model.control_points.grad
             grad_norm = float(grad.detach().norm().cpu().item()) if grad is not None else 0.0
             history_grad_norm[name].append(grad_norm)
-
-            history_loss[name].append(float(loss.detach().cpu().item()))
+            history_loss[name].append(float(total_loss.detach().cpu().item()))
 
             with torch.no_grad():
                 rgb_np = rgb_out.detach().cpu().numpy()
-                metrics = referee.evaluate(rgb_np)
-                history_sigma[name].append(metrics["sigma_v"])
-                history_vmin[name].append(metrics["v_min"])
+                rgb_display = np.clip(rgb_np, 0.0, 1.0)
 
-                # Fraction of samples outside [0, 1] (pre-clamp for baselines,
-                # direct for New sUCS) in the last forward pass.
+                metrics_report = report_referee.evaluate(rgb_display)
+                metrics_val = val_referee.evaluate(rgb_display)
+
+                history_sigma[name].append(metrics_report["sigma_v"])
+                history_vmin[name].append(metrics_report["v_min"])
+                history_sigma_val[name].append(metrics_val["sigma_v"])
+
                 frac_out = getattr(model, "last_fraction_outside", float("nan"))
                 history_fraction_outside[name].append(float(frac_out))
 
-                # Best-epoch tracking w.r.t. referee sigma_v.
-                sigma = metrics["sigma_v"]
-                if sigma < best_sigma[name] - 1e-6:
-                    best_sigma[name] = sigma
+                sigma_val = metrics_val["sigma_v"]
+                if sigma_val < best_sigma_val[name] - 1e-6:
+                    best_sigma_val[name] = sigma_val
                     best_epoch[name] = epoch
-                    best_colormaps[name] = rgb_np.copy()
+                    best_colormaps[name] = rgb_display.copy()
 
         optimizer.step()
 
-        # Project New sUCS control points back into a reasonable a'/b' range
-        # after each optimization step to reduce the chance of drifting far
-        # outside the sRGB gamut. This is a constraint in the latent space,
-        # not a hard clamp in RGB.
         with torch.no_grad():
-            if isinstance(model_sucs, OursNewSUCS):
-                bound = model_sucs.ab_bound
-                model_sucs.control_points.data[:, 1:].clamp_(-bound, bound)
+            for model in models.values():
+                model.post_step()
 
         if (epoch + 1) % 50 == 0 or epoch == 0:
-            print(
-                f"[Epoch {epoch + 1}/{num_epochs}] "
-                f"sigma_v: "
-                f"Lab={history_sigma['lab'][-1]:.4f}, "
-                f"OkLab={history_sigma['oklab'][-1]:.4f}, "
-                f"New sUCS={history_sigma['sucs'][-1]:.4f}"
+            status = ", ".join(
+                f"{COLOR_SPACE_DISPLAY_NAMES[name]}={history_sigma[name][-1]:.4f}"
+                for name in model_names
             )
+            print(f"[{cmap_name}] Epoch {epoch + 1}/{num_epochs} | report σ_v: {status}")
 
-    # Collect last-epoch RGB colormaps.
     last_colormaps = {}
     for name, model in models.items():
         with torch.no_grad():
             rgb = model(num_samples=num_samples).detach().cpu().numpy()
-        last_colormaps[name] = rgb
+        last_colormaps[name] = np.clip(rgb, 0.0, 1.0)
 
-    # Early-stopping colormaps: use the best referee sigma_v checkpoint
-    # for each model. If for some reason a model never improved, fall
-    # back to the last-epoch colormap.
     final_colormaps = {}
     for name in models.keys():
         if name in best_colormaps and len(best_colormaps[name]) > 0:
@@ -576,16 +868,12 @@ def run_optimization(
         else:
             final_colormaps[name] = last_colormaps[name]
 
-    # Simple convergence speed metric based on referee sigma_v:
-    # iteration index where sigma_v first enters a 10% band above
-    # its final value.
     convergence_iters = {}
     for name, sigma_list in history_sigma.items():
         sigma_arr = np.asarray(sigma_list, dtype=np.float64)
         initial = float(sigma_arr[0])
         final = float(sigma_arr[-1])
         if initial <= final:
-            # No improvement or divergence: mark as last epoch.
             conv_iter = len(sigma_arr) - 1
         else:
             target = final + 0.1 * (initial - final)
@@ -596,31 +884,42 @@ def run_optimization(
                     break
         convergence_iters[name] = conv_iter
 
-    print("Convergence iterations (10% band above final sigma_v):")
-    for name in ["lab", "oklab", "sucs"]:
-        print(f"  {name}: {convergence_iters[name]}")
+    print("Convergence iterations (10% band above final report-metric σ_v):")
+    for name in model_names:
+        label = COLOR_SPACE_DISPLAY_NAMES.get(name, name)
+        print(f"  [{cmap_name}] {label}: {convergence_iters[name]}")
 
-    print("Best referee sigma_v and epochs:")
-    for name in ["lab", "oklab", "sucs"]:
-        print(f"  {name}: best_sigma={best_sigma[name]:.4f} at epoch={best_epoch[name]}")
+    print("Best σ_v by validation metric and epochs:")
+    for name in model_names:
+        label = COLOR_SPACE_DISPLAY_NAMES.get(name, name)
+        print(
+            f"  [{cmap_name}] {label}: best_{val_metric}={best_sigma_val[name]:.4f} "
+            f"at epoch={best_epoch[name]}"
+        )
 
-    # Diagnostics for New sUCS mapping to sRGB at the final epoch.
-    if isinstance(model_sucs, OursNewSUCS):
-        sm = model_sucs.sucs_model
-        try:
-            lin_min, lin_max = sm.last_linear_range
-            gam_min, gam_max = sm.last_gamma_range
-            print("New sUCS -> sRGB diagnostics (final epoch):")
-            print(f"  linear RGB range: {lin_min:.6f} to {lin_max:.6f}")
-            print(f"  gamma  RGB range: {gam_min:.6f} to {gam_max:.6f}")
-            print(f"  fraction outside [0,1] (linear): {sm.last_fraction_outside_linear:.6f}")
-            print(f"  fraction outside [0,1] (gamma): {sm.last_fraction_outside_gamma:.6f}")
-        except Exception:
-            # Diagnostics are best-effort only; do not break the main run.
-            pass
+    best_sigma_report = {
+        name: float(np.min(history_sigma[name])) if history_sigma[name] else float("inf")
+        for name in models
+    }
+
+    for name, model in models.items():
+        if isinstance(model, NewSUCSpace):
+            sm = model.sucs_model
+            try:
+                lin_min, lin_max = sm.last_linear_range
+                gam_min, gam_max = sm.last_gamma_range
+                label = COLOR_SPACE_DISPLAY_NAMES.get(name, name)
+                print(f"[{cmap_name}] {label} -> sRGB diagnostics (final epoch):")
+                print(f"  linear RGB range: {lin_min:.6f} to {lin_max:.6f}")
+                print(f"  gamma  RGB range: {gam_min:.6f} to {gam_max:.6f}")
+                print(f"  fraction outside [0,1] (linear): {sm.last_fraction_outside_linear:.6f}")
+                print(f"  fraction outside [0,1] (gamma): {sm.last_fraction_outside_gamma:.6f}")
+            except Exception:
+                pass
 
     return {
         "history_sigma": history_sigma,
+        "history_sigma_val": history_sigma_val,
         "history_vmin": history_vmin,
         "history_loss": history_loss,
         "history_fraction_outside": history_fraction_outside,
@@ -629,9 +928,15 @@ def run_optimization(
         "last_colormaps": last_colormaps,
         "initial_rgb": initial_rgb,
         "convergence_iters": convergence_iters,
-        "best_sigma": best_sigma,
+        "best_sigma_val": best_sigma_val,
+        "best_sigma_report": best_sigma_report,
         "best_epoch": best_epoch,
         "best_colormaps": best_colormaps,
+        "cmap_name": cmap_name,
+        "report_metric": ref_metric,
+        "val_metric": val_metric,
+        "model_order": model_names,
+        "adjust_metadata": adjust_metadata or {},
     }
 
 
@@ -644,20 +949,24 @@ def plot_optimization_curves(
     history_sigma: dict,
     output_path: str = "optimization_uniformity.png",
     baseline_scores: dict | None = None,
+    model_order: List[str] | None = None,
+    metric_name: str | None = None,
 ):
     """
-    Plot σ_v vs. iteration for the three models (referee metric-dependent).
+    Plot ?_v vs. iteration for the three models (referee metric-dependent).
     Optionally overlays horizontal baseline lines for static colormaps
     (e.g., Viridis, Magma, Plasma).
     """
     fig, ax = plt.subplots(figsize=(7, 4))
-
     iters = range(len(next(iter(history_sigma.values()))))
-
-    ax.plot(iters, history_sigma["lab"], color="red", label="Baseline CIELAB")
-    ax.plot(iters, history_sigma["oklab"], color="green", label="Baseline OkLab")
-    ax.plot(iters, history_sigma["sucs"], color="blue", label="Ours New sUCS")
-
+    order = model_order or list(history_sigma.keys())
+    for name in order:
+        if name not in history_sigma:
+            continue
+        values = history_sigma[name]
+        label = COLOR_SPACE_DISPLAY_NAMES.get(name, name)
+        color = MODEL_COLOR_HINTS.get(name)
+        ax.plot(iters, values, label=label, color=color)
     if baseline_scores:
         styles = {
             "viridis": ("purple", "Viridis"),
@@ -672,20 +981,17 @@ def plot_optimization_curves(
                     color=color,
                     linestyle="--",
                     linewidth=1.0,
-                    label=f"{nice_name} (σ_v={sigma:.3f})",
+                    label=f"{nice_name} (?_v={sigma:.3f})",
                 )
-
+    metric_label = (metric_name or "Referee").upper()
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Referee σ_v")
-    ax.set_title("Colormap Uniformity (σ_v)")
+    ax.set_ylabel(f"{metric_label} ?_v")
+    ax.set_title(f"Colormap Uniformity ({metric_label} ?_v)")
     ax.grid(True, alpha=0.3)
     ax.legend()
-
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
-
-
 def compute_global_speed_matrix(rgb: np.ndarray, referee: Referee) -> np.ndarray:
     """
     Compute the global speed matrix V_{i,j} using the referee's metric.
@@ -743,17 +1049,24 @@ def plot_global_speed_matrices(
     final_colormaps: dict,
     referee: Referee,
     output_path: str = "global_speed_matrix.png",
+    model_order: List[str] | None = None,
 ):
     """
     Plot 1×3 heatmaps of the global speed matrices after optimization.
     """
-    names = ["lab", "oklab", "sucs"]
-    titles = ["Baseline CIELAB", "Baseline OkLab", "Ours New sUCS"]
-
-    matrices = [compute_global_speed_matrix(final_colormaps[name], referee) for name in names]
+    names = [n for n in (model_order or list(final_colormaps.keys())) if n in final_colormaps]
+    matrices = [
+        compute_global_speed_matrix(final_colormaps[name], referee)
+        for name in names
+        if name in final_colormaps
+    ]
+    titles = [COLOR_SPACE_DISPLAY_NAMES.get(name, name) for name in names if name in final_colormaps]
     vmax = max(m.max() for m in matrices)
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharex=True, sharey=True)
+    cols = len(matrices)
+    fig, axes = plt.subplots(1, cols, figsize=(4 * cols, 4), sharex=True, sharey=True)
+    if cols == 1:
+        axes = [axes]
 
     for ax, V, title in zip(axes, matrices, titles):
         im = ax.imshow(V, origin="lower", cmap="viridis", vmin=0.0, vmax=vmax)
@@ -761,7 +1074,12 @@ def plot_global_speed_matrices(
         ax.set_xlabel("j")
         ax.set_ylabel("i")
 
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label="Speed (ΔE_00 / |i - j|)")
+    metric = getattr(referee, "metric", "DE2000")
+    if metric == "DE2000":
+        speed_label = "Speed (?E_00 / |i - j|)"
+    else:
+        speed_label = "Speed (?E_CAM16 / |i - j|)"
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label=speed_label)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -799,6 +1117,7 @@ def plot_gamut_trajectory(
     final_colormaps: dict,
     referee: Referee,
     output_path: str = "gamut_trajectory_lab.png",
+    model_order: List[str] | None = None,
 ):
     """
     Plot 3D trajectories of the optimized colormaps in CIELAB space, together
@@ -822,19 +1141,19 @@ def plot_gamut_trajectory(
     )
 
     # Trajectories of the three colormaps.
-    colors = {"lab": "red", "oklab": "green", "sucs": "blue"}
-    labels = {"lab": "Baseline CIELAB", "oklab": "Baseline OkLab", "sucs": "Ours New sUCS"}
-
-    for name in ["lab", "oklab", "sucs"]:
+    order = model_order or list(final_colormaps.keys())
+    for name in order:
+        if name not in final_colormaps:
+            continue
         rgb = final_colormaps[name]
         lab = referee.rgb_to_lab(rgb)
         ax.plot(
             lab[:, 0],
             lab[:, 1],
             lab[:, 2],
-            color=colors[name],
+            color=MODEL_COLOR_HINTS.get(name),
             linewidth=2.0,
-            label=labels[name],
+            label=COLOR_SPACE_DISPLAY_NAMES.get(name, name),
         )
 
     ax.set_xlabel("L*")
@@ -852,6 +1171,7 @@ def plot_colormap_strips(
     colormaps: dict,
     referee: Referee,
     output_path: str = "colormap_strips_comparison.png",
+    model_order: List[str] | None = None,
 ):
     """
     Plot colormap strips together with local speed plots for
@@ -861,13 +1181,14 @@ def plot_colormap_strips(
         colormaps: dict with keys 'initial', 'lab', 'oklab', 'sucs';
                    values are (N, 3) numpy arrays in [0, 1].
     """
-    names = ["initial", "lab", "oklab", "sucs"]
-    titles = {
-        "initial": "Initial (Rainbow)",
-        "lab": "Baseline CIELAB",
-        "oklab": "Baseline OkLab",
-        "sucs": "Ours New sUCS",
-    }
+    names = ["initial"]
+    if model_order:
+        names.extend([n for n in model_order if n in colormaps])
+    titles = {"initial": "Initial"}
+    for name in names:
+        if name == "initial":
+            continue
+        titles[name] = COLOR_SPACE_DISPLAY_NAMES.get(name, name)
 
     num_rows = len(names)
     fig, axes = plt.subplots(
@@ -908,6 +1229,7 @@ def plot_gradient_dynamics(
     history_grad_norm: dict,
     history_fraction_outside: dict,
     output_path: str = "gradient_norm_dynamics.png",
+    model_order: List[str] | None = None,
 ):
     """
     Plot gradient norm dynamics and boundary contact rate over iterations
@@ -917,12 +1239,17 @@ def plot_gradient_dynamics(
 
     fig, axes = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
 
-    colors = {"lab": "red", "oklab": "green", "sucs": "blue"}
-    labels = {"lab": "Baseline CIELAB", "oklab": "Baseline OkLab", "sucs": "Ours New sUCS"}
+    order = model_order or list(history_grad_norm.keys())
 
-    for name in ["lab", "oklab", "sucs"]:
-        axes[0].plot(iters, history_grad_norm[name], color=colors[name], label=labels[name])
-        axes[1].plot(iters, history_fraction_outside[name], color=colors[name], label=labels[name])
+    for name in order:
+        if name not in history_grad_norm:
+            continue
+        color = MODEL_COLOR_HINTS.get(name)
+        label = COLOR_SPACE_DISPLAY_NAMES.get(name, name)
+        axes[0].plot(iters, history_grad_norm[name], color=color, label=label)
+        axes[1].plot(
+            iters, history_fraction_outside[name], color=color, label=label
+        )
 
     axes[0].set_ylabel("Grad norm")
     axes[0].set_title("Gradient Norm Dynamics")
@@ -979,6 +1306,7 @@ def _apply_colormap_to_scalar(field: np.ndarray, rgb_colormap: np.ndarray) -> np
 def plot_mach_band_tests(
     final_colormaps: dict,
     output_path: str = "mach_band_test.png",
+    model_order: List[str] | None = None,
 ):
     """
     Generate Mach-band-style test images (sine-wave grating and pyramid)
@@ -992,8 +1320,8 @@ def plot_mach_band_tests(
     fields = [sine_field, pyramid_field]
     field_titles = ["Sine-wave grating", "Pyramid"]
 
-    names = ["lab", "oklab", "sucs"]
-    titles = {"lab": "Baseline CIELAB", "oklab": "Baseline OkLab", "sucs": "Ours New sUCS"}
+    names = model_order or list(final_colormaps.keys())
+    titles = {name: COLOR_SPACE_DISPLAY_NAMES.get(name, name) for name in names}
 
     fig, axes = plt.subplots(
         len(fields),
@@ -1004,6 +1332,8 @@ def plot_mach_band_tests(
 
     for i, field in enumerate(fields):
         for j, name in enumerate(names):
+            if name not in final_colormaps:
+                continue
             rgb_cmap = final_colormaps[name]
             img = _apply_colormap_to_scalar(field, rgb_cmap)
 
@@ -1026,14 +1356,21 @@ def run_multi_seed(
     num_epochs: int,
     K: int,
     num_samples: int,
+    color_spaces: List[str],
+    learning_rate: float,
+    fidelity_weight: float,
     device: str | torch.device,
     ref_metric: str = "DE2000",
+    val_metric: str = "CAM16-UCS",
+    cmap_name: str = "rainbow",
+    gamut_penalty: float = 0.0,
+    control_point_jitter: float = 0.0,
 ) -> dict:
     """
     Run the optimization for multiple random seeds and collect the best
     referee sigma_v for each model.
     """
-    best_sigmas_per_model = {name: [] for name in ["lab", "oklab", "sucs"]}
+    best_sigmas_per_model = {name: [] for name in color_spaces}
 
     for seed in range(num_seeds):
         print(f"[Multi-seed] Running seed {seed + 1}/{num_seeds}")
@@ -1041,12 +1378,20 @@ def run_multi_seed(
             num_epochs=num_epochs,
             K=K,
             num_samples=num_samples,
+            color_spaces=color_spaces,
+            learning_rate=learning_rate,
+            fidelity_weight=fidelity_weight,
             device=device,
             ref_metric=ref_metric,
+            val_metric=val_metric,
             seed=seed,
+            cmap_name=cmap_name,
+            gamut_penalty=gamut_penalty,
+            control_point_jitter=control_point_jitter,
         )
-        for name in ["lab", "oklab", "sucs"]:
-            best_sigmas_per_model[name].append(results["best_sigma"][name])
+        for name in best_sigmas_per_model:
+            if name in results["best_sigma_val"]:
+                best_sigmas_per_model[name].append(results["best_sigma_val"][name])
 
     return best_sigmas_per_model
 
@@ -1054,26 +1399,33 @@ def run_multi_seed(
 def plot_robustness_boxplot(
     best_sigmas_per_model: dict,
     output_path: str = "robustness_boxplot.png",
+    metric_name: str = "CIEDE2000",
+    model_order: List[str] | None = None,
 ):
     """
     Plot a boxplot of best sigma_v over multiple seeds for each model.
     """
-    labels = ["Baseline CIELAB", "Baseline OkLab", "Ours New sUCS"]
-    data = [
-        best_sigmas_per_model["lab"],
-        best_sigmas_per_model["oklab"],
-        best_sigmas_per_model["sucs"],
-    ]
+    order = model_order or list(best_sigmas_per_model.keys())
+    labels: List[str] = []
+    data: List[list[float]] = []
+    filtered_order: List[str] = []
+    for name in order:
+        if name not in best_sigmas_per_model:
+            continue
+        filtered_order.append(name)
+        labels.append(COLOR_SPACE_DISPLAY_NAMES.get(name, name))
+        data.append(best_sigmas_per_model[name])
 
     fig, ax = plt.subplots(figsize=(6, 4))
     bp = ax.boxplot(data, labels=labels, patch_artist=True)
 
-    colors = ["red", "green", "blue"]
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
+    for patch, name in zip(bp["boxes"], filtered_order):
+        color = MODEL_COLOR_HINTS.get(name)
+        if color:
+            patch.set_facecolor(color)
         patch.set_alpha(0.4)
 
-    ax.set_ylabel("Best σ_v (CIEDE2000)")
+    ax.set_ylabel(f"Best σ_v ({metric_name})")
     ax.set_title("Robustness over Random Initialization Seeds")
     ax.grid(True, axis="y", alpha=0.3)
 
@@ -1102,6 +1454,8 @@ def plot_benchmark_comparison(
     history_sigma: dict,
     baseline_scores: dict,
     output_path: str = "benchmark_comparison.png",
+    model_order: List[str] | None = None,
+    metric_name: str | None = None,
 ):
     """
     Plot optimization curves together with horizontal baseline lines for
@@ -1111,20 +1465,33 @@ def plot_benchmark_comparison(
         history_sigma=history_sigma,
         output_path=output_path,
         baseline_scores=baseline_scores,
+        model_order=model_order,
+        metric_name=metric_name,
     )
-
-
 def main():
     parser = argparse.ArgumentParser(description="Colormap optimization testbed for New sUCS vs. CIELAB and OkLab")
     parser.add_argument("--epochs", type=int, default=500, help="Number of optimization epochs per run")
-    parser.add_argument("--K", type=int, default=10, help="Number of control points")
+    parser.add_argument("--K", type=int, default=10, help="Number of control points (baseline setting)")
     parser.add_argument("--num-samples", type=int, default=256, help="Number of samples in each colormap strip")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-2,
+        help="Base learning rate for all color spaces",
+    )
     parser.add_argument(
         "--ref-metric",
         type=str,
-        default="DE2000",
+        default="CAM16-UCS",
         choices=["DE2000", "CAM16-UCS"],
         help="Referee metric for local uniformity",
+    )
+    parser.add_argument(
+        "--val-metric",
+        type=str,
+        default="CAM16-UCS",
+        choices=["DE2000", "CAM16-UCS"],
+        help="Metric used for early stopping / best-checkpoint selection",
     )
     parser.add_argument(
         "--multi-seed",
@@ -1132,73 +1499,223 @@ def main():
         default=0,
         help="Number of random seeds for robustness test (0 disables multi-seed run)",
     )
+    parser.add_argument(
+        "--init-cmaps",
+        type=str,
+        nargs="+",
+        default=["rainbow"],
+        help="List of Matplotlib colormaps used as initialization (use 'all' for registry defaults)",
+    )
+    parser.add_argument(
+        "--color-spaces",
+        type=str,
+        nargs="+",
+        default=["lab", "oklab", "sucs", "jzazbz"],
+        help="Colour spaces to optimize (use 'all' to include every registered differentiable UCS)",
+    )
+    parser.add_argument(
+        "--gamut-penalty",
+        type=float,
+        default=0.0,
+        help="Weight for the quadratic penalty on RGB samples outside [0, 1]",
+    )
+    parser.add_argument(
+        "--fidelity-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the RGB fidelity term that keeps the optimized map close to the initialization",
+    )
+    parser.add_argument(
+        "--auto-adjust",
+        action="store_true",
+        help="Enable data-driven hyper-parameter adjustment based on initial sigma_v",
+    )
+    parser.add_argument(
+        "--adjust-threshold",
+        type=float,
+        default=0.10,
+        help="Sigma_v threshold that triggers the fidelity-friendly hyper-parameters",
+    )
+    parser.add_argument(
+        "--hq-min-lr",
+        type=float,
+        default=1e-3,
+        help="Lower bound for auto-adjusted learning rate",
+    )
+    parser.add_argument(
+        "--hq-max-K",
+        type=int,
+        default=32,
+        help="Maximum control point count when auto adjustment is triggered",
+    )
+    parser.add_argument(
+        "--hq-min-fidelity",
+        type=float,
+        default=0.05,
+        help="Minimum fidelity weight when auto adjustment is triggered",
+    )
+
+    parser.add_argument(
+        "--init-jitter",
+        type=float,
+        default=0.02,
+        help="Stddev of Gaussian noise applied to latent control points at initialization",
+    )
 
     args = parser.parse_args()
+
+    if args.ref_metric.upper() != "CAM16-UCS" or args.val_metric.upper() != "CAM16-UCS":
+        print("[config] Forcing CAM16-UCS for referee/validation metrics to keep evaluation consistent.")
+    args.ref_metric = "CAM16-UCS"
+    args.val_metric = "CAM16-UCS"
+    if args.init_jitter < 0.0:
+        args.init_jitter = 0.0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Single-seed main experiment (seed=0 for reproducibility).
-    results = run_optimization(
-        num_epochs=args.epochs,
-        K=args.K,
-        num_samples=args.num_samples,
-        device=device,
-        ref_metric=args.ref_metric,
-        seed=0,
-    )
+    color_spaces, skipped_spaces = resolve_color_spaces(args.color_spaces)
+    if skipped_spaces:
+        print(f"Skipping unsupported or non-optimizable color spaces: {', '.join(skipped_spaces)}")
+    if not color_spaces:
+        raise ValueError("No valid color spaces selected.")
 
-    referee = Referee(metric=args.ref_metric)
+    multiple_cmaps = resolve_colormaps(args.init_cmaps)
+    if not multiple_cmaps:
+        raise ValueError("No valid initialization colormaps were resolved.")
 
-    # Compute benchmark sigma_v for standard static colormaps.
-    baseline_scores = {
-        "viridis": compute_referee_sigma_for_cmap("viridis", args.num_samples, referee),
-        "magma": compute_referee_sigma_for_cmap("magma", args.num_samples, referee),
-        "plasma": compute_referee_sigma_for_cmap("plasma", args.num_samples, referee),
-    }
+    for cmap_name in multiple_cmaps:
+        print("=" * 60)
+        print(f"Running optimization for initialization cmap: {cmap_name}")
+        initial_evaluation: float | None = None
+        print("  Computing initial sigma_v for auto-adjustment...")
+        initial_rgb = build_initial_colormap(num_samples=args.num_samples, cmap_name=cmap_name)
+        referee_for_init = Referee(metric=args.ref_metric)
+        metrics = referee_for_init.evaluate(initial_rgb)
+        initial_evaluation = metrics["sigma_v"]
+        print(f"  Initial sigma_v ({args.ref_metric}): {initial_evaluation:.4f}")
 
-    # Plots required by the base TASK.md.
-    plot_optimization_curves(
-        results["history_sigma"],
-        output_path="optimization_uniformity.png",
-    )
-    plot_global_speed_matrices(results["final_colormaps"], referee, output_path="global_speed_matrix.png")
-    plot_gamut_trajectory(results["final_colormaps"], referee, output_path="gamut_trajectory_lab.png")
-
-    # Additional plots required by refinement.md (TVCG extension).
-    colormap_dict = dict(results["final_colormaps"])
-    colormap_dict["initial"] = results["initial_rgb"]
-    plot_colormap_strips(colormap_dict, referee, output_path="colormap_strips_comparison.png")
-    plot_gradient_dynamics(
-        results["history_grad_norm"],
-        results["history_fraction_outside"],
-        output_path="gradient_norm_dynamics.png",
-    )
-    plot_mach_band_tests(results["final_colormaps"], output_path="mach_band_test.png")
-    plot_benchmark_comparison(results["history_sigma"], baseline_scores, output_path="benchmark_comparison.png")
-
-    # Optional robustness stress test over multiple seeds.
-    if args.multi_seed > 0:
-        best_sigmas_per_model = run_multi_seed(
-            num_seeds=args.multi_seed,
+        local_K, local_lr, local_fidelity, adjust_meta = resolve_cmap_hyperparams(
+            cmap_name, args, initial_sigma_v=initial_evaluation
+        )
+        print(
+            f"  -> hyper-parameters: K={local_K}, lr={local_lr}, fidelity_weight={local_fidelity}"
+        )
+        if adjust_meta.get("auto_adjust"):
+            print(
+                f"     auto-adjust triggered (sigma_v={adjust_meta['sigma_v']:.4f} <= {args.adjust_threshold})"
+            )
+        else:
+            print("     auto-adjust inactive (threshold not met or disabled)")
+        results = run_optimization(
             num_epochs=args.epochs,
-            K=args.K,
+            K=local_K,
             num_samples=args.num_samples,
+            color_spaces=color_spaces,
+            learning_rate=local_lr,
+            fidelity_weight=local_fidelity,
+            adjust_metadata=adjust_meta,
             device=device,
             ref_metric=args.ref_metric,
+            val_metric=args.val_metric,
+            seed=0,
+            cmap_name=cmap_name,
+            gamut_penalty=args.gamut_penalty,
+            control_point_jitter=args.init_jitter,
         )
-        plot_robustness_boxplot(best_sigmas_per_model, output_path="robustness_boxplot.png")
 
-    print("Saved figures:")
-    print("  - optimization_uniformity.png")
-    print("  - global_speed_matrix.png")
-    print("  - gamut_trajectory_lab.png")
-    print("  - colormap_strips_comparison.png")
-    print("  - gradient_norm_dynamics.png")
-    print("  - mach_band_test.png")
-    print("  - benchmark_comparison.png")
-    if args.multi_seed > 0:
-        print("  - robustness_boxplot.png")
+        referee = Referee(metric=args.ref_metric)
+
+        baseline_scores = {
+            "viridis": compute_referee_sigma_for_cmap("viridis", args.num_samples, referee),
+            "magma": compute_referee_sigma_for_cmap("magma", args.num_samples, referee),
+            "plasma": compute_referee_sigma_for_cmap("plasma", args.num_samples, referee),
+        }
+
+        suffix = f"{cmap_name}_" if len(multiple_cmaps) > 1 else ""
+        def out(name: str) -> str:
+            return f"{suffix}{name}"
+
+        model_order = results["model_order"]
+        plot_optimization_curves(
+            results["history_sigma"],
+            output_path=out("optimization_uniformity.png"),
+            model_order=model_order,
+            metric_name=args.ref_metric,
+        )
+        plot_global_speed_matrices(
+            results["final_colormaps"],
+            referee,
+            output_path=out("global_speed_matrix.png"),
+            model_order=model_order,
+        )
+        plot_gamut_trajectory(
+            results["final_colormaps"],
+            referee,
+            output_path=out("gamut_trajectory_lab.png"),
+            model_order=model_order,
+        )
+
+        colormap_dict = dict(results["final_colormaps"])
+        colormap_dict["initial"] = results["initial_rgb"]
+        plot_colormap_strips(
+            colormap_dict,
+            referee,
+            output_path=out("colormap_strips_comparison.png"),
+            model_order=model_order,
+        )
+        plot_gradient_dynamics(
+            results["history_grad_norm"],
+            results["history_fraction_outside"],
+            output_path=out("gradient_norm_dynamics.png"),
+            model_order=model_order,
+        )
+        plot_mach_band_tests(
+            results["final_colormaps"],
+            output_path=out("mach_band_test.png"),
+            model_order=model_order,
+        )
+        plot_benchmark_comparison(
+            results["history_sigma"],
+            baseline_scores,
+            output_path=out("benchmark_comparison.png"),
+            model_order=model_order,
+            metric_name=args.ref_metric,
+        )
+
+        if args.multi_seed > 0:
+            best_sigmas_per_model = run_multi_seed(
+                num_seeds=args.multi_seed,
+                num_epochs=args.epochs,
+                K=local_K,
+                num_samples=args.num_samples,
+                color_spaces=model_order,
+                learning_rate=local_lr,
+                fidelity_weight=local_fidelity,
+                device=device,
+                ref_metric=args.ref_metric,
+                val_metric=args.val_metric,
+                cmap_name=cmap_name,
+                gamut_penalty=args.gamut_penalty,
+                control_point_jitter=args.init_jitter,
+            )
+            plot_robustness_boxplot(
+                best_sigmas_per_model,
+                output_path=out("robustness_boxplot.png"),
+                metric_name=args.val_metric,
+                model_order=model_order,
+            )
+
+        print("Saved figures for cmap", cmap_name)
+        print(f"  - {out('optimization_uniformity.png')}")
+        print(f"  - {out('global_speed_matrix.png')}")
+        print(f"  - {out('gamut_trajectory_lab.png')}")
+        print(f"  - {out('colormap_strips_comparison.png')}")
+        print(f"  - {out('gradient_norm_dynamics.png')}")
+        print(f"  - {out('mach_band_test.png')}")
+        print(f"  - {out('benchmark_comparison.png')}")
+        if args.multi_seed > 0:
+            print(f"  - {out('robustness_boxplot.png')}")
 
 
 if __name__ == "__main__":
