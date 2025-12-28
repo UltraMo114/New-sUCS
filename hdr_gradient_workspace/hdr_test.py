@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default="cpu",
-        help="Torch device (cpu / cuda).",
+        help="Torch device (cpu / mps / cuda).",
     )
     parser.add_argument(
         "--landscape-steps",

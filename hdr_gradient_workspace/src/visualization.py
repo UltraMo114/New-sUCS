@@ -46,7 +46,7 @@ def generate_tone_mapping_ramp_data(
     xyz_hdr = np.stack(
         [bt2020_to_xyz_np(bt2020_rgb * level, max_luminance) for level in samples]
     )
-    tensor_xyz = torch.tensor(xyz_hdr, dtype=torch.float64, device=adapter.device)
+    tensor_xyz = torch.tensor(xyz_hdr, dtype=adapter.dtype, device=adapter.device)
     coords = adapter.xyz_to_coords(tensor_xyz)
     luminance_axis = coords[..., 0]
     luminance_norm = (luminance_axis - luminance_axis.min()) / (

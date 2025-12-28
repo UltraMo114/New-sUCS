@@ -16,8 +16,10 @@ from sucs import (
     JZ_LMSP_TO_IZAZBZ,
     JZ_LMS_TO_XYZ,
     JZ_XYZ_TO_LMS,
-    pq_decode_torch,
     pq_encode_torch,
+    pq_decode_jz_torch,
+    pq_encode_jz_torch,
+    pq_decode_torch,
 )
 from colour.models.rgb.ictcp import (
     MATRIX_ICTCP_ICTCP_TO_LMS_P,
@@ -26,7 +28,11 @@ from colour.models.rgb.ictcp import (
 )
 
 SDR_WHITE_LUMINANCE = 100.0
-TORCH_DTYPE = torch.float64
+
+
+def _dtype_for_device(device: torch.device) -> torch.dtype:
+    # PyTorch MPS backend has limited / no float64 support; use float32 there.
+    return torch.float32 if device.type == "mps" else torch.float64
 
 BT2020_RGB_TO_XYZ = np.array(
     [
@@ -66,8 +72,9 @@ def bt2020_to_xyz_torch(
     Torch helper mirroring :func:`bt2020_to_xyz_np`.
     """
 
-    mat = rgb.new_tensor(BT2020_RGB_TO_XYZ, dtype=TORCH_DTYPE)
-    xyz_rel = torch.matmul(rgb.to(TORCH_DTYPE), mat.T)
+    dtype = rgb.dtype if rgb.is_floating_point() else torch.float32
+    mat = rgb.new_tensor(BT2020_RGB_TO_XYZ, dtype=dtype)
+    xyz_rel = torch.matmul(rgb.to(dtype), mat.T)
     return xyz_rel * luminance_nits
 
 
@@ -76,7 +83,8 @@ def xyz_to_bt2020_rgb_torch(xyz: torch.Tensor, luminance_nits: float) -> torch.T
     Convert XYZ back to BT.2020 linear RGB coordinates.
     """
 
-    mat = xyz.new_tensor(BT2020_XYZ_TO_RGB, dtype=TORCH_DTYPE)
+    dtype = xyz.dtype if xyz.is_floating_point() else torch.float32
+    mat = xyz.new_tensor(BT2020_XYZ_TO_RGB, dtype=dtype)
     xyz_rel = xyz / luminance_nits
     return torch.matmul(xyz_rel, mat.T)
 
@@ -86,8 +94,9 @@ def rec709_rgb_to_xyz_torch(rgb: torch.Tensor) -> torch.Tensor:
     Convert Rec.709 linear RGB (0-1) into XYZ scaled to SDR white (100 nits).
     """
 
-    mat = rgb.new_tensor(REC709_RGB_TO_XYZ, dtype=TORCH_DTYPE)
-    xyz_rel = torch.matmul(rgb.to(TORCH_DTYPE), mat.T)
+    dtype = rgb.dtype if rgb.is_floating_point() else torch.float32
+    mat = rgb.new_tensor(REC709_RGB_TO_XYZ, dtype=dtype)
+    xyz_rel = torch.matmul(rgb.to(dtype), mat.T)
     return xyz_rel * SDR_WHITE_LUMINANCE
 
 
@@ -96,7 +105,8 @@ def xyz_to_rec709_rgb_torch(xyz: torch.Tensor) -> torch.Tensor:
     Convert absolute XYZ (cd/m^2) to Rec.709 linear RGB representation.
     """
 
-    mat = xyz.new_tensor(REC709_XYZ_TO_RGB, dtype=TORCH_DTYPE)
+    dtype = xyz.dtype if xyz.is_floating_point() else torch.float32
+    mat = xyz.new_tensor(REC709_XYZ_TO_RGB, dtype=dtype)
     xyz_rel = xyz / SDR_WHITE_LUMINANCE
     return torch.matmul(xyz_rel, mat.T)
 
@@ -116,7 +126,8 @@ def cam16ucs_distance(
     cam_b = colour.XYZ_to_CAM16UCS(b)
     diff = cam_a - cam_b
     delta = np.linalg.norm(diff, axis=-1)
-    return torch.tensor(delta, dtype=TORCH_DTYPE, device=device)
+    dtype = torch.float32 if torch.device(device).type == "mps" else torch.float64
+    return torch.tensor(delta, dtype=dtype, device=device)
 
 
 @dataclass
@@ -128,6 +139,7 @@ class ColorSpaceAdapter:
     name: Literal["sucs", "jzazbz", "ictcp"]
     display_name: str
     device: torch.device
+    dtype: torch.dtype
 
     def xyz_to_coords(self, xyz: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -146,14 +158,15 @@ class SUCSAdapter(ColorSpaceAdapter):
 
     def __init__(self, device: str | torch.device = "cpu"):
         device = torch.device(device)
-        super().__init__(name="sucs", display_name="sUCS", device=device)
-        self.model = NewSUCSModel(device=device, dtype=TORCH_DTYPE)
+        dtype = _dtype_for_device(device)
+        super().__init__(name="sucs", display_name="sUCS", device=device, dtype=dtype)
+        self.model = NewSUCSModel(device=device, dtype=dtype)
 
     def xyz_to_coords(self, xyz: torch.Tensor) -> torch.Tensor:
-        return self.model.xyz_to_sucs(xyz.to(TORCH_DTYPE))
+        return self.model.xyz_to_sucs(xyz.to(self.dtype))
 
     def coords_to_xyz(self, coords: torch.Tensor) -> torch.Tensor:
-        return self.model.sucs_to_xyz(coords.to(TORCH_DTYPE))
+        return self.model.sucs_to_xyz(coords.to(self.dtype))
 
 
 class JzAzBzAdapter(ColorSpaceAdapter):
@@ -163,18 +176,19 @@ class JzAzBzAdapter(ColorSpaceAdapter):
 
     def __init__(self, device: str | torch.device = "cpu"):
         device = torch.device(device)
-        super().__init__(name="jzazbz", display_name="JzAzBz", device=device)
-        self.xyz_to_lms = torch.tensor(JZ_XYZ_TO_LMS, dtype=TORCH_DTYPE, device=device)
-        self.lms_to_xyz = torch.tensor(JZ_LMS_TO_XYZ, dtype=TORCH_DTYPE, device=device)
+        dtype = _dtype_for_device(device)
+        super().__init__(name="jzazbz", display_name="JzAzBz", device=device, dtype=dtype)
+        self.xyz_to_lms = torch.tensor(JZ_XYZ_TO_LMS, dtype=dtype, device=device)
+        self.lms_to_xyz = torch.tensor(JZ_LMS_TO_XYZ, dtype=dtype, device=device)
         self.lmsp_to_izazbz = torch.tensor(
-            JZ_LMSP_TO_IZAZBZ, dtype=TORCH_DTYPE, device=device
+            JZ_LMSP_TO_IZAZBZ, dtype=dtype, device=device
         )
         self.izazbz_to_lmsp = torch.tensor(
-            JZ_IZAZBZ_TO_LMSP, dtype=TORCH_DTYPE, device=device
+            JZ_IZAZBZ_TO_LMSP, dtype=dtype, device=device
         )
 
     def xyz_to_coords(self, xyz: torch.Tensor) -> torch.Tensor:
-        xyz = xyz.to(TORCH_DTYPE)
+        xyz = xyz.to(self.dtype)
         x = xyz[..., 0]
         y = xyz[..., 1]
         z = xyz[..., 2]
@@ -184,7 +198,7 @@ class JzAzBzAdapter(ColorSpaceAdapter):
         xyz_p = torch.stack([x_p, y_p, z_p], dim=-1)
         lms = torch.matmul(xyz_p, self.xyz_to_lms.T)
         lms = torch.clamp(lms, min=0.0)
-        lms_p = pq_encode_torch(lms)
+        lms_p = pq_encode_jz_torch(lms)
         izazbz = torch.matmul(lms_p, self.lmsp_to_izazbz.T)
         iz = izazbz[..., 0]
         az = izazbz[..., 1]
@@ -201,7 +215,7 @@ class JzAzBzAdapter(ColorSpaceAdapter):
         iz = numerator / torch.clamp(denominator, min=1e-8)
         izazbz = torch.stack([iz, az, bz], dim=-1)
         lms_p = torch.matmul(izazbz, self.izazbz_to_lmsp.T)
-        lms = pq_decode_torch(lms_p)
+        lms = pq_decode_jz_torch(lms_p)
         xyz_p = torch.matmul(lms, self.lms_to_xyz.T)
         x_p = xyz_p[..., 0]
         y_p = xyz_p[..., 1]
@@ -218,33 +232,34 @@ class ICtCpAdapter(ColorSpaceAdapter):
 
     def __init__(self, device: str | torch.device = "cpu"):
         device = torch.device(device)
-        super().__init__(name="ictcp", display_name="ICtCp", device=device)
+        dtype = _dtype_for_device(device)
+        super().__init__(name="ictcp", display_name="ICtCp", device=device, dtype=dtype)
         self.rgb_to_lms = torch.tensor(
-            MATRIX_ICTCP_RGB_TO_LMS, dtype=TORCH_DTYPE, device=device
+            MATRIX_ICTCP_RGB_TO_LMS, dtype=dtype, device=device
         )
         self.lms_to_rgb = torch.linalg.inv(self.rgb_to_lms)
         self.lmsp_to_ictcp = torch.tensor(
-            MATRIX_ICTCP_LMS_P_TO_ICTCP, dtype=TORCH_DTYPE, device=device
+            MATRIX_ICTCP_LMS_P_TO_ICTCP, dtype=dtype, device=device
         )
         self.ictcp_to_lmsp = torch.tensor(
-            MATRIX_ICTCP_ICTCP_TO_LMS_P, dtype=TORCH_DTYPE, device=device
+            MATRIX_ICTCP_ICTCP_TO_LMS_P, dtype=dtype, device=device
         )
         self.xyz_to_bt2020 = torch.tensor(
-            BT2020_XYZ_TO_RGB, dtype=TORCH_DTYPE, device=device
+            BT2020_XYZ_TO_RGB, dtype=dtype, device=device
         )
         self.bt2020_to_xyz = torch.tensor(
-            BT2020_RGB_TO_XYZ, dtype=TORCH_DTYPE, device=device
+            BT2020_RGB_TO_XYZ, dtype=dtype, device=device
         )
 
     def xyz_to_coords(self, xyz: torch.Tensor) -> torch.Tensor:
-        xyz = xyz.to(TORCH_DTYPE)
+        xyz = xyz.to(self.dtype)
         rgb_bt2020 = torch.matmul(xyz, self.xyz_to_bt2020.T)
         lms = torch.matmul(rgb_bt2020, self.rgb_to_lms.T)
         lms_p = pq_encode_torch(torch.clamp(lms, min=0.0))
         return torch.matmul(lms_p, self.lmsp_to_ictcp.T)
 
     def coords_to_xyz(self, coords: torch.Tensor) -> torch.Tensor:
-        lms_p = torch.matmul(coords.to(TORCH_DTYPE), self.ictcp_to_lmsp.T)
+        lms_p = torch.matmul(coords.to(self.dtype), self.ictcp_to_lmsp.T)
         lms = pq_decode_torch(lms_p)
         rgb_bt2020 = torch.matmul(lms, self.lms_to_rgb.T)
         return torch.matmul(rgb_bt2020, self.bt2020_to_xyz.T)

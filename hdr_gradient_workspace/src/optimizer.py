@@ -72,9 +72,10 @@ class HDRGradientOptimizer:
         self.adapter = adapter
         self.settings = settings
         self.device = torch.device(settings.device)
-        tensor_target = torch.tensor(
-            target_xyz, dtype=torch.float64, device=self.device
-        ).view(1, 3)
+        dtype = adapter.dtype
+        tensor_target = torch.tensor(target_xyz, dtype=dtype, device=self.device).view(
+            1, 3
+        )
         self.target_xyz = tensor_target
         self.hdr_coords = adapter.xyz_to_coords(tensor_target).detach()
         # Clamp luminance to SDR white for the initial guess to avoid conflicting objectives.
@@ -253,9 +254,10 @@ class HDRGradientOptimizer:
         """
 
         center = self.param.detach().clone()
-        l_offsets = torch.linspace(-l_span, l_span, steps, device=self.device, dtype=torch.float64)
-        c_offsets = torch.linspace(-chroma_span, chroma_span, steps, device=self.device, dtype=torch.float64)
-        grid = torch.zeros((steps, steps), dtype=torch.float64, device=self.device)
+        dtype = self.adapter.dtype
+        l_offsets = torch.linspace(-l_span, l_span, steps, device=self.device, dtype=dtype)
+        c_offsets = torch.linspace(-chroma_span, chroma_span, steps, device=self.device, dtype=dtype)
+        grid = torch.zeros((steps, steps), dtype=dtype, device=self.device)
         with torch.no_grad():
             for i, dl in enumerate(l_offsets):
                 for j, dc in enumerate(c_offsets):

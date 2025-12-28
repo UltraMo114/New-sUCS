@@ -1,0 +1,24 @@
+[project]
+name = "new-sucs"
+version = "0.0.0"
+description = "Gradient-descent-based colormap optimization testbed for New sUCS (scripts repo)."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "colour-science>=0.4",
+  "matplotlib>=3.5",
+  "numpy>=1.21",
+  "scipy>=1.7",
+  "torch>=1.10",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+

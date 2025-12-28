@@ -55,11 +55,16 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Unused placeholder to stay compatible with historic configs (kept for completeness).",
     )
-    parser.add_argument("--fidelity-weight", type=float, default=0.0, help="Weight for the RGB fidelity term.")
+    parser.add_argument("--fidelity-weight", type=float, default=0.0001, help="Weight for the RGB fidelity term.")
     parser.add_argument("--gamut-penalty", type=float, default=0.0, help="Penalty weight for out-of-gamut samples.")
     parser.add_argument("--ref-metric", type=str, default="CAM16-UCS", choices=["DE2000", "CAM16-UCS"])
     parser.add_argument("--val-metric", type=str, default="CAM16-UCS", choices=["DE2000", "CAM16-UCS"])
-    parser.add_argument("--device", type=str, default=None, help="Force a specific torch device (cpu or cuda).")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device (auto / cpu / mps / cuda). Default: auto.",
+    )
     parser.add_argument("--auto-adjust", action="store_true", help="Enable sigma_v-driven hyper-parameter tweaks.")
     parser.add_argument(
         "--adjust-threshold",
@@ -98,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multi-seed-csv",
         type=str,
-        default=None,
+        default="experiment-multi_seed.csv",
         help="Optional explicit path for the multi-seed statistics CSV.",
     )
     parser.add_argument(
@@ -327,7 +332,20 @@ def main() -> None:
     if args.init_jitter < 0.0:
         args.init_jitter = 0.0
 
-    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device_name = args.device or "auto"
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            device_name = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device_name = "mps"
+        else:
+            device_name = "cpu"
+
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError("Requested CUDA device, but torch.cuda.is_available() is False.")
+    if device_name == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise ValueError("Requested MPS device, but torch.backends.mps.is_available() is False.")
+
     device = torch.device(device_name)
     print(f"[collect_uniformity_metrics] Using device: {device}")
 

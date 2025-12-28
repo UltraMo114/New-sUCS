@@ -291,11 +291,12 @@ def linear_to_srgb_torch(rgb_linear: torch.Tensor) -> torch.Tensor:
 
 
 # OkLab matrices from Björn Ottosson (2020).
+# Reference: https://bottosson.github.io/posts/oklab/
 _OKLAB_M1 = np.array(
     [
-        [0.8189330101, 0.3618667424, -0.1288597137],
-        [0.0329845436, 0.9293118715, 0.0361456387],
-        [0.0482003018, 0.2643662691, 0.6338517070],
+        [0.4122214708, 0.5363325363, 0.0514459929],
+        [0.2119034982, 0.6806995451, 0.1073969566],
+        [0.0883024619, 0.2817188376, 0.6299787005],
     ],
     dtype=np.float64,
 )
@@ -311,9 +312,9 @@ _OKLAB_M2 = np.array(
 
 _OKLAB_M1_INV = np.array(
     [
-        [1.2270138511, -0.5577999807, 0.2812561490],
-        [-0.0405801784, 1.1122568696, -0.0716766787],
-        [-0.0763812845, -0.4214819784, 1.5861632204],
+        [4.0767416621, -3.3077115913, 0.2309699292],
+        [-1.2684380046, 2.6097574011, -0.3413193965],
+        [-0.0041960863, -0.7034186147, 1.7076147010],
     ],
     dtype=np.float64,
 )
@@ -355,6 +356,7 @@ PQ_C2 = 2413.0 / 128.0
 PQ_C3 = 2392.0 / 128.0
 PQ_M1 = 2610.0 / 16384.0
 PQ_M2 = 2523.0 / 32.0
+JZ_PQ_M2 = (2523.0 / 32.0) * 1.7
 JZ_B = 1.15
 JZ_G = 0.66
 JZ_D = -0.56
@@ -431,6 +433,36 @@ def pq_decode_torch(x: torch.Tensor) -> torch.Tensor:
     return 10000.0 * torch.pow(ratio, 1.0 / PQ_M1)
 
 
+def pq_encode_jz_np(x: np.ndarray) -> np.ndarray:
+    """
+    JzAzBz uses a modified ST2084 curve (m2 scaled by 1.7).
+    See colour-science `CONSTANTS_JZAZBZ_SAFDAR2017`.
+    """
+
+    x = np.clip(x, 0.0, None) / 10000.0
+    x = np.power(x, PQ_M1)
+    numerator = PQ_C1 + PQ_C2 * x
+    denominator = 1.0 + PQ_C3 * x
+    return np.power(numerator / denominator, JZ_PQ_M2)
+
+
+def pq_encode_jz_torch(x: torch.Tensor) -> torch.Tensor:
+    x = torch.clamp(x, min=0.0) / 10000.0
+    x = torch.pow(x, PQ_M1)
+    numerator = PQ_C1 + PQ_C2 * x
+    denominator = 1.0 + PQ_C3 * x
+    return torch.pow(numerator / denominator, JZ_PQ_M2)
+
+
+def pq_decode_jz_torch(x: torch.Tensor) -> torch.Tensor:
+    x = torch.clamp(x, min=0.0, max=1.0)
+    x = torch.pow(x, 1.0 / JZ_PQ_M2)
+    numerator = torch.clamp(x - PQ_C1, min=0.0)
+    denominator = PQ_C2 - PQ_C3 * x
+    ratio = torch.clamp(numerator / (denominator + 1e-12), min=0.0)
+    return 10000.0 * torch.pow(ratio, 1.0 / PQ_M1)
+
+
 def xyz_to_jzazbz_np(xyz: np.ndarray) -> np.ndarray:
     X = xyz[..., 0]
     Y = xyz[..., 1]
@@ -441,7 +473,7 @@ def xyz_to_jzazbz_np(xyz: np.ndarray) -> np.ndarray:
     xyz_p = np.stack([X_p, Y_p, Z_p], axis=-1)
     lms = np.matmul(xyz_p, JZ_XYZ_TO_LMS.T)
     lms = np.clip(lms, 0.0, None)
-    lms_p = pq_encode_np(lms)
+    lms_p = pq_encode_jz_np(lms)
     izazbz = np.matmul(lms_p, JZ_LMSP_TO_IZAZBZ.T)
     Iz = izazbz[..., 0]
     az = izazbz[..., 1]
@@ -459,7 +491,7 @@ def jzazbz_to_xyz_torch(jzazbz: torch.Tensor) -> torch.Tensor:
     Iz = numerator / torch.clamp(denominator, min=1e-8)
     izazbz = torch.stack([Iz, az, bz], dim=-1)
     lms_p = torch.matmul(izazbz, jzazbz.new_tensor(JZ_IZAZBZ_TO_LMSP).T)
-    lms = pq_decode_torch(lms_p)
+    lms = pq_decode_jz_torch(lms_p)
     xyz_p = torch.matmul(lms, jzazbz.new_tensor(JZ_LMS_TO_XYZ).T)
     X_p = xyz_p[..., 0]
     Y_p = xyz_p[..., 1]
@@ -1561,6 +1593,12 @@ def main():
         default=0.02,
         help="Stddev of Gaussian noise applied to latent control points at initialization",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device (auto / cpu / mps / cuda).",
+    )
 
     args = parser.parse_args()
 
@@ -1571,7 +1609,15 @@ def main():
     if args.init_jitter < 0.0:
         args.init_jitter = 0.0
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
     print(f"Using device: {device}")
 
     color_spaces, skipped_spaces = resolve_color_spaces(args.color_spaces)
